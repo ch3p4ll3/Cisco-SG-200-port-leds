@@ -1,9 +1,13 @@
+import logging
+
 from selenium import webdriver
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.wait import WebDriverWait
+
+logger = logging.getLogger(__name__)
 
 
 class Scraper:
@@ -14,7 +18,8 @@ class Scraper:
         self.driver = webdriver.Firefox(options=options)
 
         if url is None or username is None or password is None:
-            raise ValueError("Values cannot be None")
+            logger.error("url, username and password cannot be null")
+            raise ValueError("Credentials cannot be None")
 
         self.__url = url
         self.__username = username
@@ -37,7 +42,17 @@ class Scraper:
 
         self.__manage_leds(turn_on)
 
+    def get_led_status(self) -> bool:
+        self.__fill_credentials()
+        self.__wait_for_page_loading()
+        self.__navigate_to_led_settings()
+
+        status, _ = self.__get_led_status()
+
+        return status
+
     def __fill_credentials(self):
+        logger.debug("Filling credentials")
         elem = self.driver.find_element(By.NAME, "userName")
         elem.clear()
         elem.send_keys(self.__username)
@@ -49,21 +64,25 @@ class Scraper:
         elem.send_keys(Keys.ENTER)
 
     def __wait_for_page_loading(self):
+        logger.debug("Waiting for page loading")
         try:
-            WebDriverWait(self.driver, 100).until(
+            WebDriverWait(self.driver, 300).until(
                 EC.invisibility_of_element((By.ID, "dvProgBar"))
             )
 
-            WebDriverWait(self.driver, 100).until(
+            WebDriverWait(self.driver, 300).until(
                 EC.invisibility_of_element((By.ID, "dvProgVeil"))
             )
         finally:
             pass
-    
+
     def __navigate_to_led_settings(self):
+        logger.debug("Navigating to led settings")
         try:
-            element = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//tr[5]/td/table/tbody/tr/td/img"))
+            element = WebDriverWait(self.driver, 20).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//tr[5]/td/table/tbody/tr/td/img")
+                )
             )
 
             WebDriverWait(self.driver, 100).until(
@@ -72,20 +91,32 @@ class Scraper:
 
             element.click()
 
-
-            element = WebDriverWait(self.driver, 10).until(
+            element = WebDriverWait(self.driver, 20).until(
                 EC.element_to_be_clickable((By.XPATH, "//tr[10]/td/a/img"))
             )
             element.click()
 
-            element = WebDriverWait(self.driver, 10).until(
+            element = WebDriverWait(self.driver, 20).until(
                 EC.element_to_be_clickable((By.XPATH, "//a[@id='NAV_12']"))
             )
             element.click()
         finally:
             pass
-    
+
     def __manage_leds(self, turn_on: bool):
+        _, checkbox = self.__get_led_status()
+
+        if checkbox.is_selected() and not turn_on:
+            print("LED is already ON. Turning it OFF.")
+            checkbox.click()  # Uncheck the checkbox to turn the LED off
+        elif not checkbox.is_selected() and turn_on:
+            print("LED is already OFF. Turning it ON.")
+            checkbox.click()  # Check the checkbox to turn the LED on
+        else:
+            self.__skip_apply = True
+            print(f"LED is already {'ON' if turn_on else 'OFF'}. No action needed.")
+
+    def __get_led_status(self):
         iframe = WebDriverWait(self.driver, 10).until(
             EC.presence_of_element_located((By.XPATH, "//iframe[@id='mainFrame_gw']"))
         )
@@ -97,16 +128,8 @@ class Scraper:
             EC.visibility_of_element_located((By.XPATH, "//input[@id='chkLED']"))
         )
 
-        if checkbox.is_selected() and not turn_on:
-            print("LED is already ON. Turning it OFF.")
-            checkbox.click()  # Uncheck the checkbox to turn the LED off
-        elif not checkbox.is_selected() and turn_on:
-            print("LED is already OFF. Turning it ON.")
-            checkbox.click()  # Check the checkbox to turn the LED on
-        else:
-            self.__skip_apply = True
-            print(f"LED is already {'ON' if turn_on else 'OFF'}. No action needed.")
-    
+        return checkbox.is_selected(), checkbox
+
     def __save_and_logout(self):
         if not self.__skip_apply:
             apply_button = WebDriverWait(self.driver, 10).until(
@@ -117,9 +140,11 @@ class Scraper:
 
             try:
                 WebDriverWait(self.driver, 10).until(
-                    EC.visibility_of_element_located((By.XPATH, "//div[@id='pageMessageLine0']"))
+                    EC.visibility_of_element_located(
+                        (By.XPATH, "//div[@id='pageMessageLine0']")
+                    )
                 )
-            except:
+            except Exception:
                 pass
 
         self.driver.switch_to.default_content()
@@ -141,11 +166,10 @@ class Scraper:
             # Switch to the new window (the second window/tab opened)
             self.driver.switch_to.window(windows[1])
 
-
             confirm_logout = WebDriverWait(self.driver, 10).until(
                 EC.visibility_of_element_located((By.XPATH, "//a[@id='btnOk']"))
             )
 
             confirm_logout.click()
-        except:
+        except Exception:
             pass

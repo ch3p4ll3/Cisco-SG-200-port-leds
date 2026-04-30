@@ -1,14 +1,12 @@
 import logging
 from logging import config
 from pathlib import Path
-from os.path import exists
-from os import mkdir
 
 
 def configure_logger(base_path: Path):
-    base_path = base_path.parent
-    if not exists(base_path / "data/logs/"):
-        mkdir(base_path / "data/logs/")
+    base_path = base_path.parent / "data/logs/"
+    if not base_path.exists():
+        base_path.mkdir(parents=True, exist_ok=True)
 
     # Logging configuration dictionary
     logging_config = {
@@ -32,7 +30,7 @@ def configure_logger(base_path: Path):
                 "class": "logging.handlers.TimedRotatingFileHandler",
                 "level": "DEBUG",
                 "formatter": "detailed",
-                "filename": base_path / 'data/logs/switch-leds.log',
+                "filename": base_path / "switch-leds.log",
                 "when": "midnight",
                 "interval": 1,
                 "backupCount": 7,
@@ -42,7 +40,9 @@ def configure_logger(base_path: Path):
         "loggers": {
             "watchfiles.main": {
                 "level": "WARNING",  # Suppress DEBUG logs for watchfiles.main
-                "handlers": ["console"],  # Optionally include this for higher-level messages
+                "handlers": [
+                    "console"
+                ],  # Optionally include this for higher-level messages
                 "propagate": False,
             },
         },

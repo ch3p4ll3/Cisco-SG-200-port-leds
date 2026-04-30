@@ -1,89 +1,131 @@
-from os import getenv, name
-from datetime import datetime
-from pathlib import Path
+import json
 from logging import getLogger
+from os import getenv
+from pathlib import Path
 
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.jobstores.base import JobLookupError
+import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
-from scraper import Scraper
-from get_events_from_calendar import get_events
-from logger import configure_logger
-
+from src.logger import configure_logger
+from src.scraper import Scraper
 
 load_dotenv()
 
 base_path = Path(__file__).parent
 configure_logger(base_path)
-
-scheduler = BlockingScheduler()
 logger = getLogger(__file__)
 
-
-def run_event(switch: bool):
-    logger.debug("Running scraper")
-    with Scraper(getenv("SWITCH_URL", None), getenv("SWITCH_USERNAME", None), getenv("SWITCH_PASSWORD", None)) as sc:
-        sc.run(switch)
-
-
-def cleanup_deleted_events(calendar_event_ids):
-    for job in scheduler.get_jobs():
-        job_id: str = job.id
-
-        if job_id.endswith(":start") or job_id.endswith(":end"):
-            event_id = job_id.rsplit(":", 1)[0]
-
-            if event_id not in calendar_event_ids:
-                try:
-                    logger.debug(f"Removing old event with id {event_id}")
-                    scheduler.remove_job(job_id)
-                except JobLookupError:
-                    logger.error("Error while removing job", exc_info=True)
+# MQTT Configuration
+DISCOVERY_PREFIX = "homeassistant"
+COMPONENT = "switch"
+OBJECT_ID = "cisco_sg200_leds"
+TOPIC_BASE = f"{DISCOVERY_PREFIX}/{COMPONENT}/{OBJECT_ID}"
+COMMAND_TOPIC = f"{TOPIC_BASE}/set"
+STATE_TOPIC = f"{TOPIC_BASE}/state"
+AVAILABILITY_TOPIC = f"{TOPIC_BASE}/availability"
 
 
-def get_next_events():
-    event_ids = set()
+def run_scraper(state_on: bool):
+    """Executes the Selenium script to toggle LEDs."""
+    logger.info("Setting Cisco LEDs to: %s", "ON" if state_on else "OFF")
+    try:
+        with Scraper(
+            getenv("SWITCH_URL"),
+            getenv("SWITCH_USERNAME"),
+            getenv("SWITCH_PASSWORD"),
+        ) as sc:
+            sc.run(state_on)
+        return True
+    except Exception as e:
+        logger.exception("Scraper execution failed", exc_info=True)
+        return False
 
-    for event in get_events(getenv("EMAIL_TO_SEARCH", None), base_path):
-        event_id = event['id']
-        start = datetime.fromisoformat(event["start"].get("dateTime", event["start"].get("date")))
-        end = datetime.fromisoformat(event["end"].get("dateTime", event["end"].get("date")))
 
-        logger.debug(f"creating new job for event {event['summary']}, start: {start}, end: {end}")
+def get_led_status():
+    """Executes the Selenium script to toggle LEDs."""
+    logger.info("Getting Cisco LEDs status")
+    try:
+        status = False
 
-        scheduler.add_job(
-            run_event,
-            trigger="date",
-            id=f"{event_id}:start",
-            run_date=start,
-            kwargs={"switch": False},
-            replace_existing=True
-        )
+        with Scraper(
+            getenv("SWITCH_URL"),
+            getenv("SWITCH_USERNAME"),
+            getenv("SWITCH_PASSWORD"),
+        ) as sc:
+            status = sc.get_led_status()
+        return status
+    except Exception as e:
+        logger.exception("Scraper execution failed", exc_info=True)
+        return False
 
-        scheduler.add_job(
-            run_event,
-            trigger="date",
-            id=f"{event_id}:end",
-            run_date=end,
-            kwargs={"switch": True},
-            replace_existing=True
-        )
 
-        event_ids.add(event_id)
-    
-    cleanup_deleted_events(event_ids)
+def on_connect(client, userdata, flags, rc):
+    """Callback for when the client connects to the broker."""
+    if rc == 0:
+        logger.info("Connected to MQTT Broker!")
+        # Re-subscribe on connect (good practice for reconnections)
+        client.subscribe(COMMAND_TOPIC)
+        # Register the switch
+        setup_ha_discovery(client)
+
+        status = get_led_status()
+        client.publish(STATE_TOPIC, "ON" if status else "OFF", retain=True)
+        client.publish(AVAILABILITY_TOPIC, "online", retain=True)
+    else:
+        logger.error("Connection failed with code %d", rc)
+
+
+def on_message(client, userdata, msg):
+    """Handles incoming ON/OFF toggle from Home Assistant UI."""
+    payload = msg.payload.decode().upper()
+    logger.info("Toggle received: %s", payload)
+
+    target_state = payload == "ON"
+    success = run_scraper(target_state)
+
+    if success:
+        # Inform HA that the command was successful
+        client.publish(STATE_TOPIC, payload, retain=True)
+    else:
+        # If it fails, report the opposite to 'snap' the toggle back in the UI
+        revert_state = "OFF" if target_state else "ON"
+        client.publish(STATE_TOPIC, revert_state, retain=True)
+
+
+def setup_ha_discovery(client):
+    """Registers a single toggle switch in Home Assistant."""
+    config_payload = {
+        "name": "Cisco Switch LEDs",
+        "unique_id": "cisco_sg200_led_toggle",
+        "command_topic": COMMAND_TOPIC,
+        "state_topic": STATE_TOPIC,
+        "availability_topic": AVAILABILITY_TOPIC,
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "state_on": "ON",
+        "state_off": "OFF",
+        "device": {"identifiers": ["cisco_sg200_01"], "name": "Cisco Network Switch"},
+    }
+    client.publish(f"{TOPIC_BASE}/config", json.dumps(config_payload), retain=True)
 
 
 def main():
-    scheduler.add_job(get_next_events, "interval", minutes=15)
-    logger.debug("Press Ctrl+{} to exit".format("Break" if name == "nt" else "C"))
+    client = mqtt.Client()
+    client.username_pw_set(getenv("MQTT_USER"), getenv("MQTT_PASSWORD"))
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    # Enable a Will message: if the script crashes, HA shows the switch as 'Unavailable'
+    client.will_set(AVAILABILITY_TOPIC, "offline", retain=True)
+
+    client.connect(getenv("MQTT_BROKER"), int(getenv("MQTT_PORT", 1883)))
 
     try:
-        scheduler.start()
-    except:
-        logger.debug("Exiting")
-        return
+        client.loop_forever()
+    except KeyboardInterrupt:
+        client.publish(AVAILABILITY_TOPIC, "offline", retain=True)
+        logger.info("Service stopped.")
 
 
 if __name__ == "__main__":

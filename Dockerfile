@@ -1,5 +1,4 @@
-FROM python:3.13-slim
-WORKDIR /usr/local/app
+FROM ghcr.io/astral-sh/uv:debian-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -15,11 +14,15 @@ RUN GECKODRIVER_VERSION=$(wget -qO- "https://api.github.com/repos/mozilla/geckod
     && mv geckodriver /usr/local/bin/ \
     && rm geckodriver-$GECKODRIVER_VERSION-linux64.tar.gz
 
-# Install the application dependencies
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy the project into the image
+COPY . /app
 
-# Copy in the source code
-COPY src ./src
+# Disable development dependencies
+ENV UV_NO_DEV=1
 
-CMD ["python3", "src/main.py"]
+# Sync the project into a new environment, asserting the lockfile is up to date
+WORKDIR /app
+RUN uv sync --locked
+
+# Presuming there is a `my_app` command provided by the project
+CMD ["uv", "run", "python3", "-m", "src.main"]

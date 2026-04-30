@@ -1,0 +1,11 @@
+[project]
+name = "cisco-sg-200-port-leds"
+version = "0.1.0"
+description = "A selenium script for switching on/off switch port leds "
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "paho-mqtt>=2.1.0",
+    "python-dotenv>=1.2.2",
+    "selenium>=4.43.0",
+]
