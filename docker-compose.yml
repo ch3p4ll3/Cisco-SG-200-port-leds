@@ -1,0 +1,8 @@
+services:
+  switch-leds:
+    build: .
+    volumes:
+      - ./data:/usr/local/app/data
+      - /etc/localtime:/etc/localtime:ro
+    env_file: ".env"
+    restart: unless-stopped
