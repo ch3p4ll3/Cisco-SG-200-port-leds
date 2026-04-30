@@ -24,6 +24,8 @@ COMMAND_TOPIC = f"{TOPIC_BASE}/set"
 STATE_TOPIC = f"{TOPIC_BASE}/state"
 AVAILABILITY_TOPIC = f"{TOPIC_BASE}/availability"
 
+led_status = False
+
 
 def run_scraper(state_on: bool):
     """Executes the Selenium script to toggle LEDs."""
@@ -61,6 +63,8 @@ def get_led_status():
 
 def on_connect(client, userdata, flags, rc):
     """Callback for when the client connects to the broker."""
+    global led_status
+
     if rc == 0:
         logger.info("Connected to MQTT Broker!")
         # Re-subscribe on connect (good practice for reconnections)
@@ -68,8 +72,8 @@ def on_connect(client, userdata, flags, rc):
         # Register the switch
         setup_ha_discovery(client)
 
-        status = get_led_status()
-        client.publish(STATE_TOPIC, "ON" if status else "OFF", retain=True)
+        led_status = get_led_status()
+        client.publish(STATE_TOPIC, "ON" if led_status else "OFF", retain=True)
         client.publish(AVAILABILITY_TOPIC, "online", retain=True)
     else:
         logger.error("Connection failed with code %d", rc)
@@ -77,14 +81,23 @@ def on_connect(client, userdata, flags, rc):
 
 def on_message(client, userdata, msg):
     """Handles incoming ON/OFF toggle from Home Assistant UI."""
+    global led_status
+
     payload = msg.payload.decode().upper()
     logger.info("Toggle received: %s", payload)
 
     target_state = payload == "ON"
+
+    if target_state == led_status:
+        logger.debug("Leds already %s", "ON" if led_status else "OFF")
+        client.publish(STATE_TOPIC, payload, retain=True)
+        return
+
     success = run_scraper(target_state)
 
     if success:
         # Inform HA that the command was successful
+        led_status = target_state
         client.publish(STATE_TOPIC, payload, retain=True)
     else:
         # If it fails, report the opposite to 'snap' the toggle back in the UI
