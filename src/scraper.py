@@ -1,175 +1,164 @@
-import logging
+import binascii
+import http.cookiejar
+import re
+import urllib.request
+import xml.etree.ElementTree as ET
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.firefox.options import Options
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.wait import WebDriverWait
-
-logger = logging.getLogger(__name__)
+from Crypto.Cipher import PKCS1_v1_5
+from Crypto.PublicKey import RSA
 
 
 class Scraper:
-    def __init__(self, url: str, username: str, password: str):
-        options = Options()
-        options.add_argument("--headless")
+    def __init__(self, url, username, password):
+        self.base_url = url.rstrip("/")
+        self.username = username
+        self.password = password
+        self.domain = self.base_url.split("://")[1].split("/")[0]
 
-        self.driver = webdriver.Firefox(options=options)
-
-        if url is None or username is None or password is None:
-            logger.error("url, username and password cannot be null")
-            raise ValueError("Credentials cannot be None")
-
-        self.__url = url
-        self.__username = username
-        self.__password = password
-
-        self.__skip_apply = False
+        # Initialize session components
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookie_jar)
+        )
+        self.opener.addheaders = [
+            (
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+            ),
+            ("Accept", "*/*"),
+            ("Connection", "keep-alive"),
+        ]
 
     def __enter__(self):
-        self.driver.get(self.__url)
+        self._login()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.__save_and_logout()
-        self.driver.quit()
+        # TODO: Add logout logic here if the Cisco API supports it
+        pass
 
-    def run(self, turn_on: bool):
-        self.__fill_credentials()
-        self.__wait_for_page_loading()
-        self.__navigate_to_led_settings()
+    def _add_cookie(self, name, value):
+        cookie = http.cookiejar.Cookie(
+            version=0,
+            name=name,
+            value=value,
+            port=None,
+            port_specified=False,
+            domain=self.domain,
+            domain_specified=True,
+            domain_initial_dot=False,
+            path="/",
+            path_specified=True,
+            secure=False,
+            expires=None,
+            discard=False,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+        self.cookie_jar.set_cookie(cookie)
 
-        self.__manage_leds(turn_on)
+    def _fetch_rsa_key(self):
+        url = f"{self.base_url}/config/device/wcd?{{EncryptionSetting}}"
+        req = urllib.request.Request(
+            url, headers={"Referer": f"{self.base_url}/config/log_off_page.htm"}
+        )
+        with self.opener.open(req, timeout=10) as resp:
+            data = resp.read().decode("utf-8")
+
+        match = re.search(r"<rsaPublicKey>(.*?)</rsaPublicKey>", data, re.DOTALL)
+        if not match:
+            raise Exception("RSA public key not found")
+        return RSA.import_key(match.group(1).strip())
+
+    def _encrypt_credentials(self, rsa_key):
+        plain = f"user={self.username}&password={self.password}&ssd=true&"
+        cipher = PKCS1_v1_5.new(rsa_key)
+        encrypted = cipher.encrypt(plain.encode("utf-8"))
+        return binascii.hexlify(encrypted).decode("ascii")
+
+    def _login(self):
+        # Pre-login cookies
+        self._add_cookie("activeLangId", "English")
+        self._add_cookie("isStackableDevice", "false")
+
+        rsa_key = self._fetch_rsa_key()
+        cred_hex = self._encrypt_credentials(rsa_key)
+
+        login_url = f"{self.base_url}/config/System.xml?action=login&cred={cred_hex}"
+        req = urllib.request.Request(
+            login_url, headers={"Referer": f"{self.base_url}/config/log_off_page.htm"}
+        )
+
+        with self.opener.open(req, timeout=10) as resp:
+            resp_text = resp.read().decode("utf-8")
+            status = self._parse_status_code(resp_text)
+
+            # Extract sessionID from custom header
+            session_id = None
+            for header, value in resp.headers.items():
+                if header.lower() == "sessionid":
+                    session_id = value.split(";")[0].strip()
+                    break
+
+            if not session_id or not status:
+                raise Exception(f"Login failed: {resp_text}")
+
+            # Post-login cookies
+            self._add_cookie("sessionID", session_id)
+            self._add_cookie("userStatus", "ok")
+            self._add_cookie("usernme", self.username)
+            self._add_cookie("firstWelcomeBanner", "false")
 
     def get_led_status(self) -> bool:
-        self.__fill_credentials()
-        self.__wait_for_page_loading()
-        self.__navigate_to_led_settings()
+        """Returns True if LEDs are ON, False if MASKED/OFF."""
+        url = f"{self.base_url}/GW/wcd?{{file=/GW/Bridging/PortManagement/GreenEthernet_Props_master.xml}}{{GreenEthGlobalSetting}}{{EEEGlobalSetting}}"
+        req = urllib.request.Request(url)
+        with self.opener.open(req, timeout=10) as resp:
+            data = resp.read().decode("utf-8")
 
-        status, _ = self.__get_led_status()
-
-        return status
-
-    def __fill_credentials(self):
-        logger.debug("Filling credentials")
-        elem = self.driver.find_element(By.NAME, "userName")
-        elem.clear()
-        elem.send_keys(self.__username)
-        elem.send_keys(Keys.TAB)
-
-        elem = self.driver.find_element(By.ID, "password")
-        elem.clear()
-        elem.send_keys(self.__password)
-        elem.send_keys(Keys.ENTER)
-
-    def __wait_for_page_loading(self):
-        logger.debug("Waiting for page loading")
-        try:
-            WebDriverWait(self.driver, 300).until(
-                EC.invisibility_of_element((By.ID, "dvProgBar"))
-            )
-
-            WebDriverWait(self.driver, 300).until(
-                EC.invisibility_of_element((By.ID, "dvProgVeil"))
-            )
-        finally:
-            pass
-
-    def __navigate_to_led_settings(self):
-        logger.debug("Navigating to led settings")
-        try:
-            element = WebDriverWait(self.driver, 20).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//tr[5]/td/table/tbody/tr/td/img")
-                )
-            )
-
-            WebDriverWait(self.driver, 100).until(
-                EC.invisibility_of_element((By.ID, "dvProgVeil"))
-            )
-
-            element.click()
-
-            element = WebDriverWait(self.driver, 20).until(
-                EC.element_to_be_clickable((By.XPATH, "//tr[10]/td/a/img"))
-            )
-            element.click()
-
-            element = WebDriverWait(self.driver, 20).until(
-                EC.element_to_be_clickable((By.XPATH, "//a[@id='NAV_12']"))
-            )
-            element.click()
-        finally:
-            pass
-
-    def __manage_leds(self, turn_on: bool):
-        _, checkbox = self.__get_led_status()
-
-        if checkbox.is_selected() and not turn_on:
-            print("LED is already ON. Turning it OFF.")
-            checkbox.click()  # Uncheck the checkbox to turn the LED off
-        elif not checkbox.is_selected() and turn_on:
-            print("LED is already OFF. Turning it ON.")
-            checkbox.click()  # Check the checkbox to turn the LED on
-        else:
-            self.__skip_apply = True
-            print(f"LED is already {'ON' if turn_on else 'OFF'}. No action needed.")
-
-    def __get_led_status(self):
-        iframe = WebDriverWait(self.driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "//iframe[@id='mainFrame_gw']"))
+        tree = ET.fromstring(data)
+        led_state_element = tree.find(
+            ".//DeviceConfiguration/GreenEthGlobalSetting/maskLedState"
         )
 
-        # Switch to the iframe
-        self.driver.switch_to.frame(iframe)
+        if led_state_element is not None:
+            # maskLedState '0' means LEDs are showing (ON)
+            # maskLedState '1' means LEDs are masked (OFF)
+            return led_state_element.text == "0"
+        return False
 
-        checkbox = WebDriverWait(self.driver, 10).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@id='chkLED']"))
+    def _parse_status_code(self, data: str):
+        tree = ET.fromstring(data)
+        status = tree.find(".//ActionStatus/statusCode")
+
+        if status is not None and status.text == "0":
+            return True
+        return False
+
+    def run(self, state_on: bool):
+        """Sets the LED state."""
+        root = ET.Element("DeviceConfiguration")
+        green_eth = ET.SubElement(root, "GreenEthGlobalSetting", action="set")
+        led_state = ET.SubElement(green_eth, "maskLedState")
+
+        # Logic: To turn ON, mask must be 0. To turn OFF, mask must be 1.
+        led_state.text = "0" if state_on else "1"
+
+        payload = ET.tostring(
+            root, encoding="utf-8", method="xml", xml_declaration=True
         )
 
-        return checkbox.is_selected(), checkbox
+        headers = {
+            "Content-Type": "data:text/xml;charset=utf-8",
+            "Referer": f"{self.base_url}/home.htm",
+        }
 
-    def __save_and_logout(self):
-        if not self.__skip_apply:
-            apply_button = WebDriverWait(self.driver, 10).until(
-                EC.visibility_of_element_located((By.XPATH, "//a[@id='defaultButton']"))
-            )
+        url = f"{self.base_url}/GW/wcd"
+        req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
 
-            apply_button.click()
+        with self.opener.open(req, timeout=10) as resp:
+            data = resp.read().decode("utf-8")
+            return self._parse_status_code(data)
 
-            try:
-                WebDriverWait(self.driver, 10).until(
-                    EC.visibility_of_element_located(
-                        (By.XPATH, "//div[@id='pageMessageLine0']")
-                    )
-                )
-            except Exception:
-                pass
-
-        self.driver.switch_to.default_content()
-
-        logout_button = WebDriverWait(self.driver, 10).until(
-            EC.visibility_of_element_located((By.XPATH, "//a[@id='lnkLogout']"))
-        )
-
-        logout_button.click()
-
-        try:
-            WebDriverWait(self.driver, 10).until(
-                EC.number_of_windows_to_be(2)  # Wait for exactly 2 windows
-            )
-
-            # Get the window handles (list of open windows/tabs)
-            windows = self.driver.window_handles
-
-            # Switch to the new window (the second window/tab opened)
-            self.driver.switch_to.window(windows[1])
-
-            confirm_logout = WebDriverWait(self.driver, 10).until(
-                EC.visibility_of_element_located((By.XPATH, "//a[@id='btnOk']"))
-            )
-
-            confirm_logout.click()
-        except Exception:
-            pass
+        return False

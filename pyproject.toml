@@ -5,7 +5,10 @@ description = "A selenium script for switching on/off switch port leds "
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "crypto>=1.4.1",
     "paho-mqtt>=2.1.0",
+    "pycryptodome>=3.23.0",
     "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
     "selenium>=4.43.0",
 ]
